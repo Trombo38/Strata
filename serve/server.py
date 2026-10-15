@@ -3518,7 +3518,9 @@ class Service:
             print(f"[strata] VRAM (nvidia-smi card {named}): {out.get('vram_free_mib')} MiB free, expert cache "
                   f"{out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB "
                   f"({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", "gpu": named, **out}
+            # named (the nvidia-smi number the caller asked for) wins over the engine's
+            # gpu= on the line (its internal CUDA ordinal): the caller names cards by nvidia-smi.
+            return {"status": "ok", **out, "gpu": named}
         finally:
             if ctl is not None:
                 ctl.release()

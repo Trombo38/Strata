@@ -128,8 +128,10 @@ class NonMainCardResize(unittest.TestCase):
         svc.vision_held = False
         svc.vram_reserve = None
         svc.vram_reserve_asked = False
+        # le moteur echo gpu=<son ordinal CUDA interne> sur sa ligne VRAM: le mock le reproduit,
+        # sinon le test ne voit pas l'ecrasement du numero nvidia-smi par **out
         svc.engine.vram = mock.Mock(return_value={
-            "vram_free_mib": 6000, "expert_cache_mib": 3000,
+            "gpu": 1, "vram_free_mib": 6000, "expert_cache_mib": 3000,
             "expert_cache_full_mib": 5000, "expert_slots": 900})
         return svc
 
@@ -140,7 +142,20 @@ class NonMainCardResize(unittest.TestCase):
         # engine.vram recoit l'ordinal 1, pas le numero nvidia-smi 0
         self.assertEqual(svc.engine.vram.call_args.kwargs.get("gpu"), 1)
         self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["gpu"], 0)          # la reponse renvoie le numero nvidia-smi demande
+        self.assertEqual(out["gpu"], 0)          # la reponse renvoie le numero nvidia-smi demande,
+                                                 # pas le gpu=0/1 (ordinal) que le moteur echo
+
+    def test_main_card_keeps_the_engine_gpu_from_lying(self):
+        # le cas reel de julie : carte principale, le moteur echo gpu=0 (son ordinal),
+        # la carte principale est nvidia-smi 1 (CUDA_VISIBLE_DEVICES="1,0") -> reponse gpu: 1
+        svc = self._loaded_service("1,0")
+        svc.engine.vram = mock.Mock(return_value={
+            "gpu": 0, "vram_free_mib": 1728, "expert_cache_mib": 16384,
+            "expert_cache_full_mib": 17630, "expert_slots": 11939, "expert_slots_full": 12848})
+        out = svc.vram(2000)
+        self.assertNotIn("gpu", svc.engine.vram.call_args.kwargs)   # main card: appel 1 argument
+        self.assertEqual(out["gpu"], 1)          # nvidia-smi, pas l'ordinal 0 que le moteur echo
+        self.assertEqual(out["vram_free_mib"], 1728)
 
     def test_main_card_uses_the_old_call(self):
         svc = self._loaded_service("1,0")
