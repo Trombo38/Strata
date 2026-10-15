@@ -3484,13 +3484,18 @@ class Service:
         the engine started with), applied between requests - a request that is running finishes first (up to
         wait_s).  `gpu` names the card by its nvidia-smi number (None: the main card); it is mapped to the
         engine's ordinal bus-safely (vram_ordinal).  Only an engine started with --vram-elastic (the config's
-        "vram_elastic": true) resizes live, and today only its main card's cache is elastic.  An unloaded
-        engine applies the main card's reserve when it loads.  -> {"status": ..., and the engine's figures}."""
+        "vram_elastic": true) resizes live.  With a layer split, every card whose expert cache is segmented
+        resizes on its own device (#533 increment 2), so `gpu` names the card to resize; the main card's
+        reserve is the only one an unloaded engine remembers for the next load.
+        -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
         ordinal = self.vram_ordinal(gpu)              # nvidia-smi number -> engine ordinal (bus-safe)
         if ordinal and not self.loaded():
-            raise ValueError("VRAM: only the main card resizes, and only when the model is loaded")
+            # a non-main card's cache only exists with the model loaded; while unloaded only the main card's
+            # reserve can be remembered for the next load (the engine sizes the other caches at load time)
+            raise ValueError("VRAM: a non-main card resizes only when the model is loaded "
+                             "(while unloaded, only the main card's reserve is remembered for the next load)")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,

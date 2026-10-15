@@ -113,5 +113,49 @@ class DeviceTable(unittest.TestCase):
             self.assertIsNone(gpu_device_table({"CUDA_VISIBLE_DEVICES": "1,0"}))
 
 
+class NonMainCardResize(unittest.TestCase):
+    """#533 increment 2 : avec le modele charge, une carte non-main (layer split) se resize ;
+    la reserve y va par son ordinal, et la reponse porte le numero nvidia-smi demande."""
+
+    def _loaded_service(self, cvd):
+        svc = service_with(cvd)
+        svc.loaded = lambda: True
+        svc.fifo = mock.Mock()
+        svc.fifo.acquire.return_value = True
+        svc.batch = 0
+        svc.vision = mock.Mock()
+        svc.vision.elastic_mib = 2048
+        svc.vision_held = False
+        svc.vram_reserve = None
+        svc.vram_reserve_asked = False
+        svc.engine.vram = mock.Mock(return_value={
+            "vram_free_mib": 6000, "expert_cache_mib": 3000,
+            "expert_cache_full_mib": 5000, "expert_slots": 900})
+        return svc
+
+    def test_non_main_card_routes_by_ordinal(self):
+        # nvidia-smi 0 = 5060 Ti = ordinal moteur 1 (CUDA_VISIBLE_DEVICES="1,0")
+        svc = self._loaded_service("1,0")
+        out = svc.vram(6000, gpu=0)
+        # engine.vram recoit l'ordinal 1, pas le numero nvidia-smi 0
+        self.assertEqual(svc.engine.vram.call_args.kwargs.get("gpu"), 1)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["gpu"], 0)          # la reponse renvoie le numero nvidia-smi demande
+
+    def test_main_card_uses_the_old_call(self):
+        svc = self._loaded_service("1,0")
+        out = svc.vram(6000)                     # None = carte principale = ordinal 0
+        # main card: engine.vram(want) sans gpu= (moteur d'avant le changement)
+        self.assertNotIn("gpu", svc.engine.vram.call_args.kwargs)
+        self.assertEqual(out["gpu"], 1)          # nvidia-smi de la carte principale = out[0] = 1
+
+    def test_non_main_card_needs_the_model_loaded(self):
+        svc = service_with("1,0")
+        svc.loaded = lambda: False
+        with self.assertRaises(ValueError) as x:
+            svc.vram(6000, gpu=0)
+        self.assertIn("only when the model is loaded", str(x.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
