@@ -819,6 +819,15 @@ class StrataEngine:
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
+        table = gpu_device_table(env)                    # #533: multi-GPU only; the nvidia-smi card order
+        if table:
+            print(f"[strata] engine card order, as nvidia-smi numbers them (#533):\n{table}", flush=True)
+            if self.log not in (None, subprocess.DEVNULL):
+                try:
+                    self.log.write(f"[strata] engine card order, as nvidia-smi numbers them (#533):\n{table}\n")
+                    self.log.flush()
+                except OSError:
+                    pass
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1097,14 +1106,17 @@ class StrataEngine:
         if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
             self.last.update(offloaded=int(f[15]))
 
-    def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
-        """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
-        expert cache until that much VRAM is free, or grows it back when more is free; None: back to the reserve it
-        started with.  -> the engine's figures (expert_slots, expert_cache_mib, vram_free_mib, ...); raises ValueError
-        with the engine's reason (e.g. it was not started with --vram-elastic), EngineDied when it ended."""
+    def vram(self, reserve_mib: int | None, timeout: float = 120.0, gpu: int = 0) -> dict:
+        """#533: `VRAM [gpu] [reserve_mib]` between requests (the caller holds the service's FIFO): the engine shrinks
+        that card's expert cache until that much VRAM is free, or grows it back when more is free; None: back to the
+        reserve it started with.  `gpu` is the engine's VISIBLE CUDA ordinal (0 = the main card); the Service maps the
+        nvidia-smi number the caller asks for to it.  -> the engine's figures (expert_slots, expert_cache_mib,
+        vram_free_mib, ...); raises ValueError with the engine's reason (e.g. it was not started with --vram-elastic),
+        EngineDied when it ended."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
+        line = "VRAM" + (f" {int(gpu)}" if gpu else "") + ("" if reserve_mib is None else f" {int(reserve_mib)}")
+        self.proc.stdin.write(line + "\n")
         self.proc.stdin.flush()
         deadline = time.time() + timeout
         while True:
@@ -2785,6 +2797,39 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None) -> list[int]:
     return out
 
 
+def gpu_device_table(env: dict) -> str | None:
+    """#533 multi-GPU: the engine's card order, resolved to the numbers nvidia-smi prints.  Its
+    CUDA_VISIBLE_DEVICES (set with CUDA_DEVICE_ORDER=PCI_BUS_ID by child_env) makes the engine's internal
+    ordinal i name the nvidia-smi card cvd[i]; this prints that map with each card's PCI bus and name, so a
+    VRAM reserve asked for "card N" can be checked against the physical card it lands on.  None when there
+    is nothing to map: no CUDA_VISIBLE_DEVICES, a single card, no nvidia-smi (AMD/HIP, a missing driver)."""
+    raw = env.get("CUDA_VISIBLE_DEVICES")
+    if not raw:
+        return None
+    order = [int(t) for t in str(raw).split(",") if t.strip().lstrip("-").isdigit()]
+    if len(order) < 2:
+        return None
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,pci.bus_id,name", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    by_index = {}
+    for line in r.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3 and parts[0].isdigit():
+            by_index[int(parts[0])] = (parts[1], parts[2])
+    if not by_index:
+        return None
+    lines = []
+    for ordinal, nidx in enumerate(order):
+        bus, name = by_index.get(nidx, ("?", "unknown card"))
+        lines.append(f"engine card {ordinal} = nvidia-smi {nidx} (bus {bus}) {name}")
+    return "\n".join(lines)
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -3400,13 +3445,52 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
-    def vram(self, reserve_mib: int | None) -> dict:
-        """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
-        started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
-        engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
-        An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+    def vram_gpu_ordinals(self) -> list[int]:
+        """#533 multi-GPU: the nvidia-smi numbers of the cards the engine runs on, in the order the engine
+        numbers them internally (its CUDA ordinal).  It comes from the engine's own CUDA_VISIBLE_DEVICES, set
+        with CUDA_DEVICE_ORDER=PCI_BUS_ID (child_env), so index i here is the engine's ordinal i: the number
+        nvidia-smi prints for that card is out[i].  Absent (no gpu_list in the config) = the engine sees one
+        card, ordinal 0.  This is the bus-safe map: the caller names a card by its nvidia-smi number, the
+        engine's ordinal is looked up here, never guessed."""
+        env = getattr(self.engine, "spawn", (None,) * 5)[4] or {}
+        raw = env.get("CUDA_VISIBLE_DEVICES")
+        if raw is None:
+            raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if raw is None:
+            return []
+        out = []
+        for tok in str(raw).split(","):
+            tok = tok.strip()
+            if tok.lstrip("-").isdigit():
+                out.append(int(tok))
+        return out
+
+    def vram_ordinal(self, gpu: int | None) -> int:
+        """Map a card named by its nvidia-smi number (None: the main card) to the engine's visible CUDA
+        ordinal.  Raises ValueError with a clear reason when that card is not one the engine runs on."""
+        if gpu is None:
+            return 0
+        if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
+            raise ValueError("gpu: a whole number (a card nvidia-smi lists), or null for the main card")
+        ordinals = self.vram_gpu_ordinals()
+        if gpu in ordinals:
+            return ordinals.index(gpu)
+        named = ", ".join(str(i) for i in ordinals) if ordinals else "none (one card)"
+        raise ValueError(f"gpu: nvidia-smi card {gpu} is not a card this engine runs on "
+                         f"(it runs on nvidia-smi cards: {named})")
+
+    def vram(self, reserve_mib: int | None, gpu: int | None = None) -> dict:
+        """#533, POST /v1/vram: keep `reserve_mib` of VRAM free on a card for other programs (None: the reserve
+        the engine started with), applied between requests - a request that is running finishes first (up to
+        wait_s).  `gpu` names the card by its nvidia-smi number (None: the main card); it is mapped to the
+        engine's ordinal bus-safely (vram_ordinal).  Only an engine started with --vram-elastic (the config's
+        "vram_elastic": true) resizes live, and today only its main card's cache is elastic.  An unloaded
+        engine applies the main card's reserve when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        ordinal = self.vram_ordinal(gpu)              # nvidia-smi number -> engine ordinal (bus-safe)
+        if ordinal and not self.loaded():
+            raise ValueError("VRAM: only the main card resizes, and only when the model is loaded")
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
@@ -3421,11 +3505,15 @@ class Service:
                 return {"status": "not loaded", "reserve_mib": reserve_mib,
                         "note": "applied when the model loads"}
             # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+            want = (reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib
+            # gpu= is passed only for a non-main card: an engine built before this change takes one argument
+            out = self.engine.vram(want, gpu=ordinal) if ordinal else self.engine.vram(want)
+            named = gpu if gpu is not None else (self.vram_gpu_ordinals()[0] if self.vram_gpu_ordinals() else 0)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", **out}
+            print(f"[strata] VRAM (nvidia-smi card {named}): {out.get('vram_free_mib')} MiB free, expert cache "
+                  f"{out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB "
+                  f"({out.get('expert_slots')} experts)", flush=True)
+            return {"status": "ok", "gpu": named, **out}
         finally:
             if ctl is not None:
                 ctl.release()
@@ -5495,10 +5583,13 @@ def make_handler(svc: Service):
                     if not self._own_page("the VRAM reserve can be changed"):
                         return
                     r = req.get("reserve_mib")
+                    g = req.get("gpu")
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
+                    if g is not None and (isinstance(g, bool) or not isinstance(g, int) or g < 0):
+                        raise ValueError("gpu: a whole number (a card nvidia-smi lists), or null for the main card")
                     try:
-                        self._json(200, svc.vram(r))
+                        self._json(200, svc.vram(r, gpu=g))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return

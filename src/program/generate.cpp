@@ -9712,11 +9712,47 @@ int main(int argc, char** argv) {
             p.first_now = -1;   // laid out again at the next loan
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
-            // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib)
+            // `VRAM [gpu] [reserve_mib]`: keep `reserve_mib` of VRAM free on a card.  `gpu` is the
+            // engine's VISIBLE CUDA ordinal (0 = the main card, 1+ = a layer-split stage); the serve
+            // loop maps the nvidia-smi number the user asks for to it, so the engine never has to
+            // guess nvidia-smi's numbering (CUDA's own default order can differ from it - see #51).
+            // Bare `VRAM` and `VRAM <reserve_mib>` keep their old meaning (the main card): backward
+            // compatible.
+            const char* p = cmd.c_str() + 4;                       // past "VRAM"
+            while (*p == ' ') ++p;
+            int tgt_dev = 0;                                       // engine's visible CUDA ordinal
+            long long reserve = (long long) o.vram_reserve_mib;    // bare: the reserve the engine started with
             char* end = nullptr;
-            const bool bare = cmd.find_first_not_of(' ', 4) == std::string::npos;
-            const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
-            if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
+            const long long a = std::strtoll(p, &end, 10);
+            if (end != p) {                                        // a number given: a gpu, or the reserve
+                const char* q = end;
+                while (*q == ' ') ++q;
+                char* end2 = nullptr;
+                const long long b = std::strtoll(q, &end2, 10);
+                if (end2 != q) { tgt_dev = (int) a; reserve = b; } // "gpu reserve"
+                else reserve = a;                                  // "<reserve>" (the main card)
+                if (reserve < 0 || tgt_dev < 0) { e = "expected: VRAM [gpu] [reserve_mib]"; return false; }
+            }
+            int nvis = 0;
+            cudaGetDeviceCount(&nvis);
+            if (tgt_dev >= nvis) {
+                e = "VRAM: no visible card " + std::to_string(tgt_dev) + " (the engine sees " + std::to_string(nvis) +
+                    " card" + (nvis == 1 ? "" : "s") + "); ask for a card nvidia-smi lists";
+                return false;
+            }
+            // Only the main card's cache is elastic today: --vram-elastic segments it (docs/VRAM_ELASTIC.md).
+            // A layer-split stage's and the peer's caches are one cudaMalloc, so they report a clear per-card
+            // reason naming the card, instead of the old blanket refusal.
+            if (tgt_dev != 0) {
+                std::string kind = "a layer-split card";
+                for (auto& st : stages)
+                    if (st->dev == tgt_dev) { kind = "the layer-split card running layers [" +
+                        std::to_string(st->lb) + "," + std::to_string(st->le) + ")"; break; }
+                if (peer.valid() && o.peer_device == tgt_dev) kind = "the --peer-device card";
+                e = "VRAM: " + kind + " (engine ordinal " + std::to_string(tgt_dev) +
+                    ") is not elastic: --vram-elastic segments the main card's cache only, so only card 0 resizes live";
+                return false;
+            }
             if (!xcache.segmented()) {
                 e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
                 return false;
@@ -9725,7 +9761,7 @@ int main(int argc, char** argv) {
                 e = "VRAM: not with the resident low-RAM mode (the cache holds experts RAM does not)";
                 return false;
             }
-            if (peer.valid()) { e = "VRAM: not with --peer-device"; return false; }
+            if (peer.valid()) { e = "VRAM: not with --peer-device (the peer card keeps its --peer-reserve-mib)"; return false; }
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
@@ -9800,8 +9836,8 @@ int main(int argc, char** argv) {
                          (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
-            std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
-                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
+            std::printf("VRAM gpu=%d reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                        "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", tgt_dev, reserve,
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                         (long long) (free_b >> 20), (long long) o.prefill_chunk);
