@@ -5303,11 +5303,12 @@ int main(int argc, char** argv) {
                          profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
     }
-    // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU,
-    // no helper caches, serve mode: anything else keeps the one cudaMalloc, said once.
+    // #533: --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  A layer
+    // split is allowed now: every card's cache segments on its OWN device (the segmented path reads the current
+    // device, so each stage segments under OnDevice(st.dev) where its cache opens below).  No helper caches, serve
+    // mode: the rest keeps the one cudaMalloc, said once.
     if (o.vram_elastic) {
         const char* why = !o.serve ? "it works between requests of --serve"
-                        : multi_gpu ? "a layer split has a cache per GPU"
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
@@ -5319,6 +5320,10 @@ int main(int argc, char** argv) {
             o.vram_elastic = false;
         } else {
             xcache.set_segment_bytes(o.vram_segment_mib << 20);
+            // a layer split: every stage's cache segments too, so `VRAM <gpu> <reserve>` resizes that card's cache.
+            // Each stage opens its segments on its OWN device below (the segmented path reads the current device).
+            for (size_t i = 0; i < stages.size(); ++i)
+                stages[i]->cache.set_segment_bytes(o.vram_segment_mib << 20);
         }
     }
     if (o.expert_cache > 0) {
@@ -5574,6 +5579,9 @@ int main(int argc, char** argv) {
         // Windows commit, or the free figure ran high): it is tried again with 90% of the slots, up to 3 times, each
         // try said.  Nothing changes when the first open works.
         bool stage_open = false;
+        // #533: with --vram-elastic this stage's cache is segmented (set above); the whole open runs on its device,
+        // so the segments are created and mapped on THIS card (the segmented path reads the current device).
+        const strata::core::OnDevice seg_on(st.cache.segmented() ? st.dev : -1);
         for (int attempt = 0; !sized.empty(); ++attempt) {
             stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                                      : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
@@ -8796,7 +8804,11 @@ int main(int argc, char** argv) {
                          aov_why ? ": " : " (STRATA_ADAPT_OVERLAP=1 turns it on)", aov_why ? aov_why : "");
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
         auto res_upload = [&]() {
-            if (d_res != nullptr)
+            // res_put copies onto the device the caller selected, so the main table uploads only when device 0 is
+            // current, then each stage's copy on its own.  A VRAM resize on a stage calls this with that stage's
+            // device current (its copy is what changed).
+            int cur = 0;
+            if (cudaGetDevice(&cur) == cudaSuccess && cur == 0 && d_res != nullptr)
                 res_put(d_res);
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
@@ -9699,17 +9711,26 @@ int main(int argc, char** argv) {
         const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
         auto relend = [&]() {   // the prompt path's loan: the end of the slots left, its chunk as large as fits
             if (pf_parts.empty() || pf_parts[0].first < 0) return;
-            PfPart& p = pf_parts[0];
-            const int64_t live = xcache.slots();
+            // every participant lends the SAME chunk, so the largest one every lending cache can afford is taken
+            // (a shrunk card leaves fewer slots: its share shrinks with it, the others follow).
             auto fits = [&](int64_t c) {
-                const int64_t k = part_slots(p, c);
-                return k > 0 && k + 128 <= live && !(o.prefill_auto && k * 100 > kAutoLendPct * live);
+                for (const PfPart& q : pf_parts) {
+                    if (q.first < 0) continue;   // not lending
+                    const int64_t live = q.cache->slots();
+                    const int64_t k = part_slots(q, c);
+                    if (k <= 0 || k + 128 > live) return false;
+                    if (o.prefill_auto && k * 100 > kAutoLendPct * live) return false;
+                }
+                return true;
             };
             int64_t c = chunk_full;
             while (c > 256 && !fits(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
             o.prefill_chunk = c;
-            p.first = (int32_t) std::max<int64_t>(0, live - part_slots(p, c));
-            p.first_now = -1;   // laid out again at the next loan
+            for (PfPart& p : pf_parts) {
+                if (p.first < 0) continue;
+                p.first = (int32_t) std::max<int64_t>(0, p.cache->slots() - part_slots(p, c));
+                p.first_now = -1;   // laid out again at the next loan
+            }
         };
         auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
             // `VRAM [gpu] [reserve_mib]`: keep `reserve_mib` of VRAM free on a card.  `gpu` is the
@@ -9740,21 +9761,27 @@ int main(int argc, char** argv) {
                     " card" + (nvis == 1 ? "" : "s") + "); ask for a card nvidia-smi lists";
                 return false;
             }
-            // Only the main card's cache is elastic today: --vram-elastic segments it (docs/VRAM_ELASTIC.md).
-            // A layer-split stage's and the peer's caches are one cudaMalloc, so they report a clear per-card
-            // reason naming the card, instead of the old blanket refusal.
+            // #533: --vram-elastic now segments every card's cache on its own device (docs/VRAM_ELASTIC.md), so a
+            // layer-split card resizes live too.  The target is the main card, or a stage whose cache is segmented;
+            // the peer card keeps its own --peer-reserve-mib and reports a clear reason naming it.
+            strata::core::ExpertCache* tgt = &xcache;
             if (tgt_dev != 0) {
+                strata::core::ExpertCache* hit = nullptr;
                 std::string kind = "a layer-split card";
                 for (auto& st : stages)
-                    if (st->dev == tgt_dev) { kind = "the layer-split card running layers [" +
+                    if (st->dev == tgt_dev) { hit = &st->cache; kind = "the layer-split card running layers [" +
                         std::to_string(st->lb) + "," + std::to_string(st->le) + ")"; break; }
                 if (peer.valid() && o.peer_device == tgt_dev) kind = "the --peer-device card";
-                e = "VRAM: " + kind + " (engine ordinal " + std::to_string(tgt_dev) +
-                    ") is not elastic: --vram-elastic segments the main card's cache only, so only card 0 resizes live";
-                return false;
+                if (hit == nullptr || !hit->segmented()) {
+                    e = "VRAM: " + kind + " (engine ordinal " + std::to_string(tgt_dev) +
+                        ") has no elastic cache to resize: --vram-elastic segments the main card and each layer-split "
+                        "card, not the peer card";
+                    return false;
+                }
+                tgt = hit;
             }
-            if (!xcache.segmented()) {
-                e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
+            if (!tgt->segmented()) {
+                e = "VRAM needs an engine started with --vram-elastic (NVIDIA, --serve)";
                 return false;
             }
             if (src.complement_ready()) {
@@ -9766,6 +9793,9 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
             adapt_quiesce();                         // the adaptive tier's swaps in flight land first (async too)
+            // #533: the resize moves the TARGET card's cache.  Quiesce and read the free VRAM on that device, and
+            // every cache call below (shrink/grow/fill) runs under this guard so its segments map on the target.
+            const strata::core::OnDevice vram_on(tgt_dev);
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -9773,35 +9803,49 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             size_t free_b = 0, total_b = 0;
             cudaMemGetInfo(&free_b, &total_b);
-            const int64_t want_free = (int64_t) reserve << 20, mapped = xcache.mapped_bytes();
-            const int64_t before = xcache.slots();
+            const int64_t want_free = (int64_t) reserve << 20, mapped = tgt->mapped_bytes();
+            const int64_t before = tgt->slots();
+            // #533 per-card: slot numbers are PER CACHE (the main card's and each stage's arena is its own, so the
+            // same number means a different slot on a different card).  The residency index -> owning card mapping is
+            // the layer split itself: a layer's experts live in the cache of the card that runs that layer.  So the
+            // bookkeeping below (evict, refill) touches only the experts THIS card's cache holds.
+            int tgt_stage = 0;
+            for (size_t i = 0; i < stages.size(); ++i)
+                if (&stages[i]->cache == tgt) tgt_stage = (int) i + 1;
+            auto owned = [&](size_t i) {
+                return (multi_gpu ? stage_of((int64_t) i / g.n_expert) : 0) == tgt_stage;
+            };
             // what stays at least: the prompt path's smallest loan (256 tokens) and the 128 slots it must leave
-            const int64_t floor_slots = std::min<int64_t>(xcache.full_slots(),
-                128 + (pf_parts.empty() || pf_parts[0].first < 0 ? 0 : part_slots(pf_parts[0], 256)));
+            const PfPart* tpart = nullptr;
+            for (const PfPart& q : pf_parts)
+                if (q.cache == tgt) { tpart = &q; break; }
+            const int64_t floor_slots = std::min<int64_t>(tgt->full_slots(),
+                128 + (tpart == nullptr || tpart->first < 0 ? 0 : part_slots(*tpart, 256)));
             std::string note;
             if ((int64_t) free_b < want_free) {
-                const int64_t floor_b = xcache.bytes_of(floor_slots);
+                const int64_t floor_b = tgt->bytes_of(floor_slots);
                 int64_t keep = mapped - (want_free - (int64_t) free_b);
                 if (keep < floor_b) {
                     keep = floor_b;
                     note = " (the cache keeps its smallest size: the prompt path's buffers)";
                 }
-                if (!xcache.shrink(keep, e)) return false;
-                const int64_t live = xcache.slots();
+                if (!tgt->shrink(keep, e)) return false;
+                const int64_t live = tgt->slots();
                 for (size_t i = 0; i < host_res.size(); ++i)
-                    if (host_res[i] >= live) {
+                    if (host_res[i] >= live && owned(i)) {
                         vram_evicted.emplace_back((int32_t) i, host_res[i]);
                         host_res[i] = strata::core::kNotResident;
                     }
                 res_upload();
-            } else if (mapped < xcache.full_bytes()) {
+            } else if (mapped < tgt->full_bytes()) {
                 std::string gerr;
-                if (!xcache.grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
-                const int64_t live = xcache.slots();
+                if (!tgt->grow(mapped + ((int64_t) free_b - want_free), gerr)) note = " (" + gerr + ")";
+                const int64_t live = tgt->slots();
                 std::string ferr;
                 std::vector<std::pair<int32_t, int32_t>> keep_out;
                 for (const auto& [i, slot] : vram_evicted) {
-                    if (slot >= live) { keep_out.emplace_back(i, slot); continue; }
+                    // an expert another card's shrink gave up: it stays parked in the list, this card cannot back it
+                    if (!owned((size_t) i) || slot >= live) { keep_out.emplace_back(i, slot); continue; }
                     const int64_t layer = i / g.n_expert;
                     int64_t pick = i;
                     if (host_res[(size_t) i] >= 0) {   // back already (the adaptive tier): the layer's most-routed miss
@@ -9816,7 +9860,7 @@ int main(int argc, char** argv) {
                     }
                     if (pick < 0) continue;
                     const uint8_t* b = srcp->blob_stable(layer, pick % g.n_expert);
-                    if (b == nullptr || !xcache.fill_slot_queued(slot, b, ferr,
+                    if (b == nullptr || !tgt->fill_slot_queued(slot, b, ferr,
                             (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer))) {
                         e = "VRAM: refilling the cache failed: " + ferr;
                         return false;
@@ -9825,21 +9869,21 @@ int main(int argc, char** argv) {
                     host_res[(size_t) pick] = slot;
                 }
                 vram_evicted.swap(keep_out);
-                if (!xcache.sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
+                if (!tgt->sync_queued(ferr)) { e = "VRAM: " + ferr; return false; }
                 res_upload();
             }
-            relend();
+            relend();   // every lending card re-lends at the shared chunk, each from the slots it has left
             cudaMemGetInfo(&free_b, &total_b);
-            std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free: the expert cache %lld -> %lld of %lld slots "
-                                 "(%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
-                         reserve, (long long) before, (long long) xcache.slots(), (long long) xcache.full_slots(),
-                         (double) xcache.mapped_bytes() / 1073741824.0, (double) xcache.full_bytes() / 1073741824.0,
+            std::fprintf(stderr, "strata serve: VRAM %lld MiB kept free on CUDA%d: the expert cache %lld -> %lld of "
+                                 "%lld slots (%.2f of %.2f GiB), %lld MiB free now, prompt chunk %lld, in %.0f ms%s\n",
+                         reserve, tgt_dev, (long long) before, (long long) tgt->slots(), (long long) tgt->full_slots(),
+                         (double) tgt->mapped_bytes() / 1073741824.0, (double) tgt->full_bytes() / 1073741824.0,
                          (long long) (free_b >> 20), (long long) o.prefill_chunk,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
             std::printf("VRAM gpu=%d reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
                         "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", tgt_dev, reserve,
-                        (long long) xcache.slots(), (long long) xcache.full_slots(),
-                        (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
+                        (long long) tgt->slots(), (long long) tgt->full_slots(),
+                        (long long) (tgt->mapped_bytes() >> 20), (long long) (tgt->full_bytes() >> 20),
                         (long long) (free_b >> 20), (long long) o.prefill_chunk);
             return true;
         };
